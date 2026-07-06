@@ -93,12 +93,12 @@ local function resolveToolForPlayer(player: Player, candidate: any): Tool?
 			or (player:FindFirstChild("Backpack") and tool:IsDescendantOf(player.Backpack))
 	end
 
-	-- Prefer explicitly-passed tool
+	-- prefer explicitly-passed tool
 	if typeof(candidate) == "Instance" and candidate:IsA("Tool") and owns(candidate) then
 		return candidate
 	end
 
-	-- Fall back to currently held tool
+	-- fall back to held tool
 	local held = character:FindFirstChildOfClass("Tool")
 	if held and owns(held) then return held end
 
