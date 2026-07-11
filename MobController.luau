@@ -1,4 +1,5 @@
 -- roblox Username: RodolfoDev, discord username: _.rodolfo
+-- Connected Discord-GitHub
 --!strict
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
