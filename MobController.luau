@@ -1,3 +1,4 @@
+--!strict
 -- roblox Username: RodolfoDev, discord username: _.rodolfo
 -- Connected Discord-GitHub
 
