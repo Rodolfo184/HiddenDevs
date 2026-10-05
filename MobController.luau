@@ -1,949 +1,607 @@
 --!strict
 -- roblox Username: RodolfoDev, discord username: _.rodolfo
 -- Connected Discord-GitHub
---[[
-	MobController -- the server-side combat brain of one hostile mob.
-
-	The AI Director owns the Heartbeat loop and creates one controller per
-	live mob. It calls step() on the archetype's decision interval and
-	steer() on its faster movement interval, so nothing here may yield: a
-	hundred mobs share one tick.
-
-	  * A finite state machine. Each state is a plain table tagged with its
-	    name (Types.State is a tagged union) with enter / step / exit
-	    handlers in the States table. A handler never switches state itself:
-	    it RETURNS the next state and the dispatcher in step() runs exit and
-	    enter, so every side effect of a change lives in one place. Handlers
-	    narrow the union with `::` because the dispatcher already matched
-	    the tag.
-	  * A blackboard: memory that outlives state changes -- who the target
-	    is, where it was last seen, how worked up the mob is (aggression)
-	    and the timestamps that gate attacks and guards.
-	  * Swings, blocks and parries run through CombatController, the same
-	    code path players use, so a mob obeys the same reach, posture, parry
-	    window and animation rules a player does.
-
-	The Director is handed in through setDirector() instead of being
-	required, because Director requires this module (a require cycle
-	otherwise).
-]]
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerScriptService = game:GetService("ServerScriptService")
 
-local CombatController = require(ReplicatedStorage.Modules.CombatController)
-local Janitor = require(ReplicatedStorage.Modules.Icon.Packages.Janitor)
-local Perception = require(ServerScriptService.Modules.AI.Perception)
-local Types = require(ReplicatedStorage.Modules.AI.Types)
+local Modules = ReplicatedStorage.Modules
+local CombatConfig = require(Modules.CombatConfig)
+local EnemyConfig = require(Modules.Enemy.EnemyConfig)
+local HudConfig = require(Modules.HudConfig)
+local Motion = require(Modules.Motion)
+local NetCombat = require(Modules.NetCombat)
+local PartyConfig = require(Modules.PartyConfig)
+local SettingsConfig = require(Modules.SettingsConfig)
+local ShopConfig = require(Modules.ShopConfig)
+local SkillTreeConfig = require(Modules.SkillTreeConfig)
 
--- Tuning shared by every archetype. Per-mob numbers (reach, speeds, timings,
--- chances) live in the archetype config so designers can tune a mob without
--- touching this file.
-local STALK_START_AGGRESSION = 0.5 -- fraction of engageThreshold on first sight
-local STALK_RESET_AGGRESSION = 0.6 -- aggression is capped here after two whiffs
-local FIRST_STRAFE_DELAY = 0.5 -- beat before the first sidestep, reads as noticing
-local STRAFE_FLIP_CHANCE = 0.35 -- chance to reverse orbit direction per sidestep
-local STRAFE_STEP = 3 -- studs to close or back off per sidestep
-local STRAFE_SIDE_STEP = 2 -- lateral studs mixed into a close/back-off step
-local STRAFE_ORBIT_STEP = 4 -- pure lateral studs when already at standoff
-local STANDOFF_INNER_SLACK = 2 -- back off when closer than standoff - this
-local STANDOFF_OUTER_SLACK = 3 -- close in when farther than standoff + this
-local DEFEND_REACH_SLACK = 1 -- guards react a stud outside attack reach
-local PARRY_HOLD = 0.3 -- how long a parry stays up after the telegraph
-local DEFEND_COOLDOWN = 0.35 -- gap between reactive guards
-local HOLD_BLOCK_CHECK_INTERVAL = 0.5 -- the hold-block roll runs at most 2x/s
-local WHIFFS_BEFORE_RESET = 2 -- misses in a row before backing off to stalk
-local SWING_ANIM_GRACE = 1 -- hard cap on waiting for a swing track to end
-local WAYPOINT_REACHED_SQ = 4 -- 2 studs, squared (compared without a sqrt)
-local FACE_EPSILON_SQ = 0.0004 -- 0.02 studs, squared: closer than this, don't aim
+local PULL_STOP_DISTANCE = 3 -- stop pulling inside this range
+local REPUTATION_CAP = 0.18 -- max rep bonus (18%)
+local HITBOX_PADDING = 0.25 -- hitbox edge leniency
+local TIMER_SLACK = 0.01
+local BASE_WALK_SPEED = 16
+local FLAT = Vector3.new(1, 0, 1)
 
--- Combat states in which the rig keeps turning toward its target. AttackActive
--- is left out on purpose: the swing animation owns the rotation there.
-local FACE_TARGET_STATES: { [Types.StateTag]: boolean } = table.freeze({
-	Engaging = true,
-	AttackWindup = true,
-	Recovery = true,
-	Defending = true,
-})
+-- distance a strength 1 knockback covers, used to convert pulls
+local PULL_REACH = Motion.travel({
+	speed = 1,
+	time = CombatConfig.knockback.time,
+	taper = CombatConfig.knockback.taper,
+}, CombatConfig.knockback.time)
 
-local rng = Random.new()
-
-local Controller = {}
-Controller.__index = Controller
-
--- The slice of CombatController a mob touches. Typing the dependency
--- structurally keeps this file honest about what it uses and decoupled from
--- the combat module's internals.
-type CombatHandle = {
-	State: string,
-	ActiveAttackTrack: AnimationTrack?,
-	doM1: (self: CombatHandle, tool: Tool) -> (),
-	doCrit: (self: CombatHandle, tool: Tool) -> (),
-	doFistM1: (self: CombatHandle) -> (),
-	guardPressed: (self: CombatHandle, tool: Tool) -> (),
-	fistGuardPressed: (self: CombatHandle) -> (),
-	guardReleased: (self: CombatHandle) -> (),
+type Modifiers = {
+	power: number?,
+	crit: number?,
+	critDmg: number?,
+	charge: number?,
+	basicHit: boolean?,
+	origin: CFrame?,
+	valid: (() -> boolean)?,
 }
 
--- What the Director exposes back to a controller: the shared pathfinding
--- queue, and the per-target "swing slot" that stops a crowd of mobs from all
--- landing hits on the same player in the same instant.
-type DirectorApi = {
-	requestPath: (ctrl: Controller, from: Vector3, to: Vector3) -> (),
-	clearPath: (ctrl: Controller) -> (),
-	tryClaimSwingSlot: (target: Model, owner: Model, now: number, window: number) -> boolean,
-}
+-- config tables inherit from their skill through __index, hence rawget for optional keys
+type SkillData = { [string]: any }
+type IgnoreFilter = (Model) -> boolean
+type HitList = { [Instance]: boolean }
 
-type ControllerFields = {
-	mob: Model,
+type Cast = {
+	character: Model,
 	humanoid: Humanoid,
-	hrp: BasePart,
-	combat: CombatHandle,
-	archetype: Types.ArchetypeConfig,
-	director: DirectorApi,
-	replicateState: boolean,
-	blackboard: Types.Blackboard,
-	state: Types.State,
-	lastPercept: Types.PerceptionResult,
-	guardRaised: boolean,
-	-- scheduling, owned by the Director's tick loop
-	nextDecisionAt: number,
-	nextSteerAt: number,
-	nextRepathAt: number,
-	lastStepAt: number,
-	-- the current path, filled in asynchronously by the Director
-	waypoints: { PathWaypoint }?,
-	waypointIdx: number,
-	alive: boolean,
-	janitor: typeof(Janitor.new()),
+	skill: SkillData,
+	ignore: IgnoreFilter?,
+	modifiers: Modifiers?,
+	-- client input, untrusted until point() checks it
+	pointFunction: (() -> any)?,
+	isLocked: boolean,
+	lockedOrigin: CFrame?,
+	aimSpot: Vector3?,
 }
 
-export type Controller = typeof(setmetatable({} :: ControllerFields, Controller))
+local SkillCombat = {}
 
--- enter and exit are optional so states without setup or teardown don't need
--- placeholder functions.
-type Handlers = {
-	enter: ((ctrl: Controller, state: Types.State, now: number) -> ())?,
-	exit: ((ctrl: Controller, state: Types.State, now: number) -> ())?,
-	step: (ctrl: Controller, state: Types.State, now: number, elapsed: number) -> Types.State,
-}
+-- aggro listens to this, so all damage has to go through strike()
+SkillCombat.hit = Instance.new("BindableEvent")
 
-local States: { [Types.StateTag]: Handlers } = {}
+local hitTracks: { [Animator]: { [string]: AnimationTrack } } = {}
+-- weak keys so destroyed models dont stick around
+local slowUntil = setmetatable({} :: { [Model]: number }, { __mode = "k" })
+local stunUntil = setmetatable({} :: { [Model]: number }, { __mode = "k" })
 
-local director: DirectorApi? = nil
-
-local function setDirector(api: DirectorApi)
-	director = api
+local function getHumanoid(model: Model): Humanoid?
+	return model:FindFirstChildOfClass("Humanoid") :: Humanoid?
 end
 
-local function getEquippedTool(mob: Model): Tool?
-	return mob:FindFirstChildOfClass("Tool")
+local function getRootPart(model: Model): BasePart?
+	return model:FindFirstChild("HumanoidRootPart") :: BasePart?
 end
 
-local function rootPartOf(model: Model): BasePart?
-	local root = model:FindFirstChild("HumanoidRootPart")
-	return if root and root:IsA("BasePart") then root else nil
-end
-
--- A target is only worth acting on while it is still in the world with a
--- living humanoid. Every state re-checks this because a player can die,
--- respawn or leave between two decision ticks.
-local function liveTarget(ctrl: Controller): Model?
-	local target = ctrl.blackboard.target
-	if not target or not target.Parent then
-		return nil
-	end
-	local humanoid = target:FindFirstChildWhichIsA("Humanoid")
-	if not humanoid or humanoid.Health <= 0 then
-		return nil
-	end
-	return target
-end
-
-local function liveTargetRoot(ctrl: Controller): (Model?, BasePart?)
-	local target = liveTarget(ctrl)
-	if not target then
-		return nil, nil
-	end
-	return target, rootPartOf(target)
-end
-
--- Squared distance: every reach test compares against a squared reach so the
--- hot path never pays for a square root.
-local function distanceSq(a: Vector3, b: Vector3): number
-	local delta = b - a
-	return delta:Dot(delta)
-end
-
--- Horizontal (XZ) offset from one point to another. Aiming, cone tests and
--- waypoint checks all ignore height on purpose: the rig only ever yaws (see
--- faceTowards), so measuring in the plane it turns in is what keeps the arc
--- test honest when a player stands on a ledge above or below the mob.
 local function flatOffset(from: Vector3, to: Vector3): Vector3
-	return Vector3.new(to.X - from.X, 0, to.Z - from.Z)
+	return (to - from) * FLAT
 end
 
--- Which way to circle, chosen fresh each time stalking starts so the orbit
--- direction is not predictable.
-local function pickStrafeDir(): number
-	return if rng:NextInteger(0, 1) == 0 then 1 else -1
+-- only the newest timer gets to clear it
+local function isLatestTimer(timers: { [Model]: number }, model: Model): boolean
+	return (timers[model] or 0) <= os.clock() + TIMER_SLACK
 end
 
--- Guard calls run inside the shared Director tick, so a bug in one rig's
--- animation set must not abort every other mob's update for that frame:
--- fence it and report it instead of letting it propagate.
-local function guarded(fn: () -> ())
-	local ok, err = pcall(fn)
-	if not ok then
-		warn("[MobController]", err)
-	end
-end
-
--- Swinging flips on the moment a move begins (windup included) while State
--- only turns "attacking" once the swing itself starts; reading both gives the
--- earliest possible tell that a hit is coming.
-local function isMidSwing(target: Model): boolean
-	if target:GetAttribute("Swinging") == true then
-		return true
-	end
-	local combat = CombatController.fromCharacter(target) :: CombatHandle?
-	return combat ~= nil and combat.State == "attacking"
-end
-
--- Locks the closest visible player into the blackboard and returns its
--- character, or nil when nothing is in view.
-local function acquireVisibleTarget(ctrl: Controller, now: number): Model?
-	local player = ctrl.lastPercept.closestVisible
-	local character = if player then player.Character else nil
-	local root = if character then rootPartOf(character) else nil
-	if not character or not root then
+-- skills run off timers, recheck the caster every step
+local function getCastRoot(cast: Cast): BasePart?
+	if not cast.character.Parent or cast.humanoid.Health <= 0 then
 		return nil
 	end
-	local bb = ctrl.blackboard
-	bb.target = character
-	bb.targetPlayer = player
-	bb.lastSeen = now
-	bb.lastKnownPos = root.Position
-	return character
-end
-
--- Refreshes the memory of where the target is, but only while the mob can
--- actually see it -- otherwise it would "know" where a hidden player went.
--- Returns whether the target was in view this tick.
-local function refreshSighting(ctrl: Controller, root: BasePart, now: number): boolean
-	local player = ctrl.blackboard.targetPlayer
-	local seen = player ~= nil and table.find(ctrl.lastPercept.visible, player) ~= nil
-	if seen then
-		ctrl.blackboard.lastSeen = now
-		ctrl.blackboard.lastKnownPos = root.Position
+	local valid = if cast.modifiers then cast.modifiers.valid else nil
+	if valid and not valid() then
+		return nil
 	end
-	return seen
+	return getRootPart(cast.character)
 end
 
--- Transition builders. Each returns its concrete state type (a member of the
--- Types.State union), so the literal's tag is checked at the definition and
--- no handler has to spell the record out inline.
-local function toIdle(): Types.StateIdle
-	return { tag = "Idle" }
-end
-
-local function toEngaging(target: Model): Types.StateEngaging
-	return { tag = "Engaging", target = target }
-end
-
-local function toStalking(target: Model, nextStrafeAt: number): Types.StateStalking
-	return {
-		tag = "Stalking",
-		target = target,
-		nextStrafeAt = nextStrafeAt,
-		strafeDir = pickStrafeDir(),
-	}
-end
-
--- Head to `at` (default: wherever the target was last seen, else stay put) and
--- give up after the archetype's memory window.
-local function toSearching(ctrl: Controller, now: number, at: Vector3?): Types.StateSearching
-	return {
-		tag = "Searching",
-		lastKnown = at or ctrl.blackboard.lastKnownPos or ctrl.hrp.Position,
-		endsAt = now + ctrl.archetype.memoryDuration,
-	}
-end
-
-local function toAttackWindup(target: Model, endsAt: number): Types.StateAttackWindup
-	return { tag = "AttackWindup", target = target, endsAt = endsAt }
-end
-
-local function toAttackActive(target: Model, endsAt: number): Types.StateAttackActive
-	return { tag = "AttackActive", target = target, endsAt = endsAt, hitFired = false }
-end
-
-local function toDefending(raiseAt: number, endsAt: number, isParry: boolean): Types.StateDefending
-	return { tag = "Defending", raiseAt = raiseAt, endsAt = endsAt, isParry = isParry }
-end
-
-local function toRecovery(ctrl: Controller, now: number, didHit: boolean): Types.StateRecovery
-	return {
-		tag = "Recovery",
-		endsAt = now + ctrl.archetype.recoveryDuration,
-		didHit = didHit,
-	}
-end
-
--- Where to step next while stalking: back off inside the standoff band, close
--- in outside it, otherwise orbit sideways. `side` is the XZ perpendicular of
--- the direction to the target, signed by the current orbit direction.
-local function strafeGoal(ctrl: Controller, targetPos: Vector3, sign: number): Vector3
-	local pos = ctrl.hrp.Position
-	local standoff = ctrl.archetype.standoff
-	local flat = flatOffset(pos, targetPos)
-	local dist = flat.Magnitude
-	local forward = if dist > 0.001 then flat / dist else Vector3.zAxis
-	local side = Vector3.new(-forward.Z, 0, forward.X) * sign
-	if dist < standoff - STANDOFF_INNER_SLACK then
-		return pos - forward * STRAFE_STEP + side * STRAFE_SIDE_STEP
+-- locked skills keep their cast position even if you move
+local function getCastOrigin(cast: Cast, root: BasePart): CFrame
+	if cast.isLocked and not cast.lockedOrigin then
+		cast.lockedOrigin = root.CFrame
 	end
-	if dist > standoff + STANDOFF_OUTER_SLACK then
-		return pos + forward * STRAFE_STEP + side * STRAFE_SIDE_STEP
+	return if cast.isLocked then cast.lockedOrigin :: CFrame else root.CFrame
+end
+
+-- cached per animator, no LoadAnimation spam during combos
+local function getHitTrack(animator: Animator, key: string, animationId: string): AnimationTrack?
+	local tracks = hitTracks[animator]
+	if not tracks then
+		tracks = {}
+		hitTracks[animator] = tracks
+		animator.Destroying:Connect(function()
+			hitTracks[animator] = nil
+		end)
 	end
-	return pos + side * STRAFE_ORBIT_STEP
+	if tracks[key] then
+		return tracks[key]
+	end
+
+	local animation = Instance.new("Animation")
+	animation.AnimationId = animationId
+	-- can throw if the rig is getting removed
+	local ok, result = pcall(animator.LoadAnimation, animator, animation)
+	if not ok or not result then
+		return nil
+	end
+	local track = result :: AnimationTrack
+	track.Priority = Enum.AnimationPriority.Action3
+	track.Looped = false
+	tracks[key] = track
+	return track
 end
 
--- Yaw-only cone test. The rig is aimed with a flat lookAt (its LookVector has
--- no pitch), so the arc has to be measured in the horizontal plane too:
--- dotting the full 3D offset would shrink the cosine whenever the player is
--- above or below, and fail the arc more the closer the mob gets.
-local function inYawCone(hrp: BasePart, point: Vector3, halfArcRad: number): boolean
-	local flat = flatOffset(hrp.Position, point)
-	local cosine = flat:Dot(hrp.CFrame.LookVector) / math.max(flat.Magnitude, 1e-4)
-	return cosine >= math.cos(halfArcRad)
-end
+-- big knockback = launch anim, otherwise normal flinch
+local function playHitAnimation(model: Model, knockback: number?)
+	local humanoid = getHumanoid(model)
+	if not humanoid or humanoid.Health <= 0 or not CombatConfig.hitAnim then
+		return
+	end
+	local animator = humanoid:FindFirstChildOfClass("Animator") :: Animator?
+	if not animator then
+		return
+	end
+	local isLaunch = knockback ~= nil and knockback >= (CombatConfig.knockbackAnimMin or math.huge)
+	local key = if isLaunch then "launch" else "hit"
+	-- fall back to the flinch if theres no launch anim
+	local launchId = CombatConfig.knockbackAnim or CombatConfig.hitAnim
+	local track = getHitTrack(animator, key, if isLaunch then launchId else CombatConfig.hitAnim)
+	if not track then
+		return
+	end
 
--- Does the swing volume in front of the rig actually contain the target? The
--- box query is the most expensive geometric test here, so it runs last.
-local function overlapsTarget(hrp: BasePart, arch: Types.ArchetypeConfig, target: Model): boolean
-	local parts = Perception.overlapForward(hrp, arch.attackReach, arch.attackOverlapHalfWidth)
-	for _, part in ipairs(parts) do
-		if part:IsDescendantOf(target) then
-			return true
+	-- stop the flinch or it twitches under the launch
+	for otherKey, otherTrack in pairs(hitTracks[animator]) do
+		if otherKey ~= key and otherTrack.IsPlaying then
+			otherTrack:Stop(0.05)
 		end
 	end
-	return false
+	-- restart so every hit gets its own flinch
+	if track.IsPlaying then
+		track:Stop(0)
+	end
+	track:Play(if isLaunch then CombatConfig.knockbackFade else CombatConfig.hitFade)
 end
 
--- Fists are always available; M1 and Crit are weapon swings, so the caller
--- has already made sure a tool is in hand before this runs.
-local function performSwing(combat: CombatHandle, kind: Types.AttackKind, tool: Tool?)
-	if kind == "Fist" then
-		combat:doFistM1()
-	elseif tool and kind == "Crit" then
-		combat:doCrit(tool)
-	elseif tool then
-		combat:doM1(tool)
+local function endSlow(model: Model)
+	if not model.Parent or not isLatestTimer(slowUntil, model) then
+		return
+	end
+	slowUntil[model] = nil
+	model:SetAttribute(CombatConfig.slowAttribute, false)
+	-- only reset if nothing else changed the speed meanwhile
+	local humanoid = getHumanoid(model)
+	local slow = CombatConfig.hitSlow
+	if not humanoid or humanoid.Health <= 0 or humanoid.WalkSpeed ~= slow.walkSpeed then
+		return
+	end
+	-- blocking has its own walkspeed
+	local base = if model:GetAttribute(CombatConfig.blockAttribute)
+		then BASE_WALK_SPEED * CombatConfig.block.walkSpeedMultiplier
+		else slow.restore
+	humanoid.WalkSpeed = base * (model:GetAttribute(SkillTreeConfig.attributes.speed) or 1)
+end
+
+-- slows only ever extend, never shorten
+local function applySlow(model: Model, seconds: number?)
+	local slow = CombatConfig.hitSlow
+	if not slow or not seconds or seconds <= 0 then
+		return
+	end
+	local humanoid = getHumanoid(model)
+	local expiresAt = os.clock() + seconds
+	if not humanoid or humanoid.Health <= 0 or (slowUntil[model] or 0) >= expiresAt then
+		return
+	end
+	slowUntil[model] = expiresAt
+	-- flag first so speed listeners already see it
+	model:SetAttribute(CombatConfig.slowAttribute, true)
+	humanoid.WalkSpeed = slow.walkSpeed
+	task.delay(seconds, endSlow, model)
+end
+
+-- buffs are attributes on server time so clients can read them too
+local function getBuff(model: Model?, kind: string): number?
+	local name = if model then CombatConfig.buffAttributes[kind] else nil
+	if not model or not name then
+		return nil
+	end
+	if workspace:GetServerTimeNow() >= (model:GetAttribute(name .. "Until") or 0) then
+		return nil
+	end
+	return model:GetAttribute(name)
+end
+
+local function endStun(model: Model)
+	if model.Parent and isLatestTimer(stunUntil, model) then
+		stunUntil[model] = nil
+		model:SetAttribute(CombatConfig.stunAttribute, false)
 	end
 end
 
---[[
-	The moment of truth for an attack. Every check is a cheap reject before a
-	more expensive one, so the raycast and the box overlap only run when the
-	geometry already says a hit is plausible:
-	  1. the mob can physically perform this attack kind (weapon in hand),
-	  2. the target is alive, has a root part and is a player character,
-	  3. it is inside reach and inside the yaw cone the rig is aiming in,
-	  4. nothing solid is in the way -- a FRESH raycast; the perception
-	     cache is fine for "can I see you" but too stale for "will I hit you",
-	  5. the swing volume actually contains a part of the target,
-	  6. the Director grants this mob the target's swing slot for the window.
-	Returns true when a swing was started.
-]]
-local function tryFireSwing(ctrl: Controller, now: number): boolean
-	local arch = ctrl.archetype
-	local tool = getEquippedTool(ctrl.mob)
-	if arch.attackKind ~= "Fist" and not tool then
+-- slow outlasts the stun a bit so they cant instantly run off
+local function applyStun(model: Model, seconds: number, _attacker: Model?, knockback: number?)
+	if seconds <= 0 then
+		return
+	end
+	playHitAnimation(model, knockback)
+	applySlow(model, math.max(seconds, CombatConfig.hitSlow.minimum) + CombatConfig.hitSlow.tail)
+	stunUntil[model] = math.max(stunUntil[model] or 0, os.clock() + seconds)
+	model:SetAttribute(CombatConfig.stunAttribute, true)
+	task.delay(seconds, endStun, model)
+end
+
+function SkillCombat.stunned(model: Model?): boolean
+	return model ~= nil and (stunUntil[model] or 0) > os.clock()
+end
+
+local function hasPvpEnabled(player: Player): boolean
+	local level = player:GetAttribute("Level") or 1
+	return SettingsConfig.get("pvp", player) == true and level >= SettingsConfig.pvpLevel
+end
+
+-- is the other side outside this exam?
+local function isExamOutsider(ownerId: number?, other: Player?, otherOwnerId: number?): boolean
+	if not ownerId or (other and other.UserId == ownerId) then
 		return false
 	end
-	local target, root = liveTargetRoot(ctrl)
-	if not target or not root or not Players:GetPlayerFromCharacter(target) then
+	return otherOwnerId ~= ownerId
+end
+
+local function canHurt(attacker: Model?, victim: Model?): boolean
+	if not attacker or not victim then
+		return true
+	end
+	local attackerPlayer = Players:GetPlayerFromCharacter(attacker)
+	local victimPlayer = Players:GetPlayerFromCharacter(victim)
+
+	-- pvp needs both players opted in, party members cant hit each other
+	if attackerPlayer and victimPlayer then
+		local optedIn = hasPvpEnabled(attackerPlayer) and hasPvpEnabled(victimPlayer)
+		if attackerPlayer ~= victimPlayer and not optedIn then
+			return false
+		end
+		if not PartyConfig.canHurt(attackerPlayer, victimPlayer) then
+			return false
+		end
+	end
+	-- players cant hurt story escorts
+	if attackerPlayer and victim:GetAttribute("StoryEscort") then
 		return false
 	end
-	if distanceSq(ctrl.hrp.Position, root.Position) > arch.attackReach * arch.attackReach then
+
+	-- exam npcs only fight their examinee, examinees only fight the exam
+	local attackerExam = attacker:GetAttribute("ExamOwner")
+	local victimExam = victim:GetAttribute("ExamOwner")
+	if isExamOutsider(attackerExam, victimPlayer, victimExam) then
 		return false
 	end
-	if not inYawCone(ctrl.hrp, root.Position, arch.attackArcHalfRad) then
+	if isExamOutsider(victimExam, attackerPlayer, attackerExam) then
 		return false
 	end
-	if not Perception.losCheckFresh(ctrl.hrp, root) then
+	if attacker:GetAttribute("ExamActive") and not victimExam then
 		return false
 	end
-	if not overlapsTarget(ctrl.hrp, arch, target) then
+	return not (victim:GetAttribute("ExamActive") and not attackerExam)
+end
+
+local function isValidTarget(
+	attacker: Model?, model: Model, humanoid: Humanoid, ignore: IgnoreFilter?
+): boolean
+	if humanoid.Health <= 0 or (ignore and ignore(model)) then
 		return false
 	end
-	if not ctrl.director.tryClaimSwingSlot(target, ctrl.mob, now, arch.swingSlotWindow) then
+	return canHurt(attacker, model) and not model:GetAttribute(CombatConfig.invulnerableAttribute)
+end
+
+-- skip accessories/tools, only the actual body counts
+local function bodyHit(part: BasePart): (Model?, Humanoid?)
+	if part:FindFirstAncestorWhichIsA("Accessory") or part:FindFirstAncestorOfClass("Tool") then
+		return nil, nil
+	end
+	local model = part:FindFirstAncestorOfClass("Model") :: Model?
+	local humanoid = if model then getHumanoid(model) else nil
+	if not humanoid then
+		return nil, nil
+	end
+	return model, humanoid
+end
+
+-- bounds overreach on rotated limbs, so test the closest point instead
+local function touches(origin: CFrame, boxSize: Vector3, part: BasePart): boolean
+	local localCentre = part.CFrame:PointToObjectSpace(origin.Position)
+	local half = part.Size / 2
+	local closest = Vector3.new(
+		math.clamp(localCentre.X, -half.X, half.X),
+		math.clamp(localCentre.Y, -half.Y, half.Y),
+		math.clamp(localCentre.Z, -half.Z, half.Z)
+	)
+	local offset = origin:PointToObjectSpace(part.CFrame:PointToWorldSpace(closest))
+	local reach = boxSize / 2 + Vector3.one * HITBOX_PADDING
+	return math.abs(offset.X) <= reach.X
+		and math.abs(offset.Y) <= reach.Y
+		and math.abs(offset.Z) <= reach.Z
+end
+
+-- attacker side only, the victims defenses get applied in strike
+local function getDamage(
+	attacker: Model?, data: SkillData, modifiers: Modifiers?
+): (number, Player?)
+	local owner = if attacker then Players:GetPlayerFromCharacter(attacker) else nil
+	local damage = data.damage * (if modifiers then modifiers.power or 1 else 1)
+	-- npcs dont get rep or shop boosts
+	if owner then
+		local reputation = math.clamp(owner:GetAttribute("ReputationBonus") or 0, 0, REPUTATION_CAP)
+		damage = damage * (1 + reputation) * (ShopConfig.boost(owner, "damage") or 1)
+	end
+	local crit = if modifiers then modifiers.crit or 0 else 0
+	if crit > 0 and math.random() < crit then
+		damage *= (modifiers :: Modifiers).critDmg or 1
+	end
+	if not attacker then
+		return damage, owner
+	end
+	if attacker:GetAttribute(EnemyConfig.attribute) then
+		damage *= EnemyConfig.damageScale
+	end
+	return damage * (attacker:GetAttribute(SkillTreeConfig.attributes.damage) or 1), owner
+end
+
+-- blocks only work from the front
+local function isBlocking(model: Model, attacker: Model?): boolean
+	if model:GetAttribute(CombatConfig.blockAttribute) ~= true then
 		return false
 	end
-	-- doM1/doCrit yield while they wire up animation marker signals; a fresh
-	-- thread lets that happen without stalling the Director's Heartbeat, and
-	-- fences any error inside the swing away from every other mob's update.
-	task.spawn(performSwing, ctrl.combat, arch.attackKind, tool)
+	local body = getRootPart(model)
+	local from = if attacker then getRootPart(attacker) else nil
+	local offset = if body and from then flatOffset(body.Position, from.Position) else Vector3.zero
+	local facing = if body then body.CFrame.LookVector * FLAT else Vector3.zero
+	-- cant tell the angle, count it as blocked
+	if offset.Magnitude < 0.5 or facing.Magnitude < 0.01 then
+		return true
+	end
+	local halfArc = math.rad(CombatConfig.block.arc / 2)
+	return facing.Unit:Dot(offset.Unit) >= math.cos(halfArc) - 1e-3
+end
+
+-- away from the attacker, or their facing if theyre on top of each other
+local function getKnockbackDirection(root: BasePart, attacker: Model?): Vector3
+	local from = if attacker then getRootPart(attacker) else nil
+	local base = if from then from.CFrame else root.CFrame
+	local direction = flatOffset(base.Position, root.Position)
+	if direction.Magnitude <= 0.1 then
+		direction = base.LookVector * FLAT
+	end
+	return if direction.Magnitude > 0.1 then direction.Unit else Vector3.new(0, 0, -1)
+end
+
+local function applyHitReaction(
+	attacker: Model?, model: Model, data: SkillData, modifiers: Modifiers?, centre: Vector3?
+)
+	local isBasic = modifiers ~= nil and modifiers.basicHit == true
+	local player = Players:GetPlayerFromCharacter(model)
+	-- basic hits use hitPush instead of knockback
+	local knockback = if isBasic then 0 else data.knockback or 0
+
+	-- extra hold on npcs for laggy combos, npc basic hits stun players less
+	local stun = data.stun
+	if isBasic and not player then
+		stun += CombatConfig.npcComboGrace
+	elseif isBasic and attacker and attacker:GetAttribute(EnemyConfig.attribute) then
+		stun *= EnemyConfig.playerStunScale
+	end
+	applyStun(model, stun, attacker, knockback)
+
+	local root = getRootPart(model)
+	if not root then
+		return
+	end
+	local direction = getKnockbackDirection(root, attacker)
+	-- drag toward the middle, converted into a knockback strength
+	local toCentre = if centre then flatOffset(root.Position, centre) else Vector3.zero
+	local pull = data.pull or 0
+	if knockback <= 0 and pull > 0 and toCentre.Magnitude > PULL_STOP_DISTANCE then
+		direction, knockback = toCentre.Unit, toCentre.Magnitude * pull / PULL_REACH
+	end
+
+	-- client owns its character physics so it does the push itself
+	if player then
+		if knockback > 0 then
+			NetCombat:FireClient(player, "knockback", direction, knockback)
+		elseif isBasic then
+			NetCombat:FireClient(player, "hitPush", direction)
+		end
+	elseif knockback > 0 then
+		-- npc humanoids brake raw impulses, so use the tapered dash
+		Motion.dash(root, direction, CombatConfig.knockback, nil, knockback)
+	elseif isBasic then
+		Motion.hitPush(root, direction, CombatConfig.hitPush)
+	end
+end
+
+-- all damage goes through here, false = target skipped
+local function strike(
+	attacker: Model?, model: Model, humanoid: Humanoid, part: BasePart, alreadyHit: HitList,
+	data: SkillData, ignore: IgnoreFilter?, modifiers: Modifiers?, centre: Vector3?
+): boolean
+	if alreadyHit[humanoid] or not isValidTarget(attacker, model, humanoid, ignore) then
+		return false
+	end
+	alreadyHit[humanoid] = true
+
+	local damage, owner = getDamage(attacker, data, modifiers)
+	local reduction = model:GetAttribute(SkillTreeConfig.attributes.reduction) or 0
+	damage *= 1 - math.clamp(reduction, 0, SkillTreeConfig.reductionCap)
+	damage *= 1 - math.clamp(getBuff(model, "resist") or 0, 0, 1)
+	local blocked = isBlocking(model, attacker)
+	if blocked then
+		damage *= 1 - CombatConfig.block.damageReduction
+	end
+	if owner and Players:GetPlayerFromCharacter(model) then
+		damage *= CombatConfig.pvpDamage
+	end
+
+	-- use actual health lost (forcefields, overkill)
+	local before = humanoid.Health
+	if damage > 0 then
+		humanoid:TakeDamage(damage)
+	end
+	local dealt = math.max(0, before - humanoid.Health)
+	if dealt <= 0 and not blocked then
+		return true
+	end
+	if not blocked then
+		applyHitReaction(attacker, model, data, modifiers, centre)
+	end
+
+	-- effect uses the defenders weapon on a block
+	local _, weapon = CombatConfig.forCharacter(if blocked then model else attacker)
+	local style = if not weapon or weapon == CombatConfig.Fists then "Fists" else "Weapon"
+	local isBasic = modifiers ~= nil and modifiers.basicHit == true
+	local effectPart = getRootPart(model) or part
+	local wear = if blocked then HudConfig.blockWear(data) else nil
+	ReplicatedStorage.Remotes.DamageFeedback:FireAllClients(model, dealt, blocked)
+	NetCombat:FireAllClients("hit", effectPart, blocked, dealt, style, isBasic, attacker)
+	SkillCombat.hit:Fire(attacker, model, dealt, blocked, humanoid.Health <= 0, wear)
 	return true
 end
 
---[[
-	Reactive defence. When the target is mid-swing and close enough, choose
-	between a parry (raised after a short, readable telegraph so the parry
-	window lines up with the incoming hit) and a block (raised now, held for
-	a random spell). Returns the Defending state to enter, or nil when the
-	mob should carry on with what it was doing.
-]]
-local function tryReactiveGuard(
-	ctrl: Controller,
-	target: Model,
-	distSq: number,
-	now: number
-): Types.StateDefending?
-	local arch = ctrl.archetype
-	if not (arch.canBlock or arch.canParry) or now < ctrl.blackboard.nextDefendReady then
-		return nil
+-- shared alreadyHit so multi frame hitboxes only hit once
+local function sample(
+	attacker: Model, origin: CFrame, size: Vector3, alreadyHit: HitList, data: SkillData,
+	ignore: IgnoreFilter?, modifiers: Modifiers?, radius: number?
+)
+	local box = if radius then Vector3.new(radius * 2, size.Y, radius * 2) else size
+	local centre = origin.Position
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { attacker }
+
+	for _, part in ipairs(workspace:GetPartBoundsInBox(origin, box, params)) do
+		local model, humanoid = bodyHit(part)
+		if not model or not humanoid or alreadyHit[humanoid] then
+			continue
+		end
+		-- radius checks ignore height
+		local root = getRootPart(model)
+		local isInside = if radius
+			then root ~= nil and flatOffset(centre, root.Position).Magnitude <= radius
+			else touches(origin, box, part)
+		if isInside then
+			strike(attacker, model, humanoid, part, alreadyHit, data, ignore, modifiers, centre)
+		end
 	end
-	local reach = arch.attackReach + DEFEND_REACH_SLACK
-	if distSq > reach * reach or not isMidSwing(target) then
-		return nil
-	end
-	if arch.canParry and rng:NextNumber() < arch.parryChance then
-		local raiseAt = now + arch.reactDelay
-		return toDefending(raiseAt, raiseAt + PARRY_HOLD, true)
-	end
-	if arch.canBlock then
-		local hold = rng:NextNumber(arch.blockTimeMin, arch.blockTimeMax)
-		return toDefending(now, now + hold, false)
-	end
-	return nil
 end
 
--- Occasionally raise a sustained guard while in range and uncommitted. The
--- roll is throttled so holdBlockChance keeps meaning "per half second" no
--- matter how short the archetype's decision interval is.
-local function tryHoldBlock(ctrl: Controller, distSq: number, now: number): Types.StateDefending?
-	local arch = ctrl.archetype
-	local bb = ctrl.blackboard
-	if not arch.canBlock or arch.holdBlockChance <= 0 then
+-- validate the client point, v ~= v catches NaN
+function SkillCombat.point(root: BasePart, position: any, reach: number): Vector3?
+	if typeof(position) ~= "Vector3" or position ~= position then
 		return nil
 	end
-	local reach = arch.attackReach + DEFEND_REACH_SLACK
-	if now < bb.nextHoldBlockReady or now < bb.nextHoldBlockCheck or distSq > reach * reach then
-		return nil
+	local offset = flatOffset(root.Position, position)
+	if offset.Magnitude <= reach then
+		return position
 	end
-	bb.nextHoldBlockCheck = now + HOLD_BLOCK_CHECK_INTERVAL
-	if rng:NextNumber() >= arch.holdBlockChance then
-		return nil
-	end
-	local hold = rng:NextNumber(arch.holdBlockMin, arch.holdBlockMax)
-	return toDefending(now, now + hold, false)
+
+	-- too far, clamp it and snap to the ground
+	local clamped = root.Position + offset.Unit * reach
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { root.Parent :: Instance }
+	local above = clamped + Vector3.new(0, 60, 0)
+	local ground = workspace:Raycast(above, Vector3.new(0, -400, 0), params)
+	return if ground then ground.Position else clamped
 end
 
--- Only ask the Director for a path when there is none, or when the target has
--- moved far enough from where the current path was aimed that following it
--- would walk the mob to empty ground. Pathfinding is the most expensive thing
--- a mob does; this and the Director's cooldown are what keep it rare.
-local function requestPathIfStale(ctrl: Controller, from: Vector3, to: Vector3)
-	local aimedAt = ctrl.blackboard.lastPathTarget
-	local stale = ctrl.waypoints == nil
-		or (aimedAt ~= nil and (aimedAt - to).Magnitude > ctrl.archetype.repathDistThreshold)
-	if not stale then
+-- new hit list each tick so the field keeps hurting
+local function fieldTick(cast: Cast, field: SkillData)
+	local root = getCastRoot(cast)
+	if root then
+		local cframe = getCastOrigin(cast, root) * CFrame.new(0, 0, -field.forward)
+		sample(cast.character, cframe, field.size, {}, field, cast.ignore, cast.modifiers)
+	end
+end
+
+-- atAim hits go on the target spot, the rest go in front
+local function meleeStep(
+	cast: Cast, data: SkillData, size: Vector3, radius: number?, alreadyHit: HitList
+)
+	local root = getCastRoot(cast)
+	if not root then
 		return
 	end
-	ctrl.director.requestPath(ctrl, from, to)
-	ctrl.blackboard.lastPathTarget = to
+	local target = if data.atAim then cast.aimSpot else nil
+	if data.atAim and not target and cast.pointFunction then
+		target = SkillCombat.point(root, cast.pointFunction(), cast.skill.aimReach)
+	end
+	local rise = rawget(data, "rise") or 0
+	local cframe = if target
+		then CFrame.new(target)
+		else getCastOrigin(cast, root) * CFrame.new(0, rise, -data.forward)
+	sample(cast.character, cframe, size, alreadyHit, data, cast.ignore, cast.modifiers, radius)
 end
 
--- Weapon and fist guards are different moves in CombatController, so pick by
--- what is in hand at the moment the guard comes up, not when it was decided.
-local function raiseGuard(ctrl: Controller)
-	local tool = getEquippedTool(ctrl.mob)
-	guarded(function()
-		if tool then
-			ctrl.combat:guardPressed(tool)
-		else
-			ctrl.combat:fistGuardPressed()
-		end
-	end)
-	ctrl.guardRaised = true
-end
-
--- Planting (WalkSpeed 0, AutoRotate off) is how the windup and guard states
--- hold still while steer() keeps aiming the rig with CFrame -- AutoRotate
--- would fight that aim. Any pending path is dropped: the mob is committing
--- to this spot.
-local function plant(ctrl: Controller)
-	ctrl.humanoid.WalkSpeed = 0
-	ctrl.humanoid.AutoRotate = false
-	ctrl.director.clearPath(ctrl)
-end
-
-local function unplant(ctrl: Controller)
-	ctrl.humanoid.WalkSpeed = ctrl.archetype.runSpeed
-	ctrl.humanoid.AutoRotate = true
-end
-
--- Yaw the rig toward a point without tilting it: the target's height is
--- discarded so a player on a ledge does not pitch the mob over. Skipped when
--- the mob is standing on the point -- lookAt has no defined heading for a
--- zero-length direction.
-local function faceTowards(hrp: BasePart, point: Vector3)
-	local flat = flatOffset(hrp.Position, point)
-	if flat:Dot(flat) <= FACE_EPSILON_SQ then
-		return
+-- sampled across the window so fast targets dont slip through
+local function scheduleMeleeHit(cast: Cast, data: SkillData)
+	-- charge scales the hitbox, radius hits scale radius/height instead
+	local charge = if cast.modifiers then cast.modifiers.charge or 1 else 1
+	local size = data.size * charge
+	local radius = rawget(data, "radius")
+	if radius then
+		radius *= charge
+		size = Vector3.new(radius * 2, (rawget(data, "height") or data.size.Y) * charge, radius * 2)
 	end
-	hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + flat)
-end
-
--- Advance along the Director-supplied waypoints. A waypoint counts as reached
--- on horizontal distance only, so a step or slope under the mob never leaves
--- it circling a point it can not get "close enough" to. When the list runs
--- out the path is dropped and Engaging asks for a new one.
-local function followPath(self: Controller)
-	local waypoints = self.waypoints
-	if not waypoints then
-		return
-	end
-	local waypoint = waypoints[self.waypointIdx]
-	if waypoint then
-		local flat = flatOffset(self.hrp.Position, waypoint.Position)
-		if flat:Dot(flat) < WAYPOINT_REACHED_SQ then
-			self.waypointIdx += 1
-			waypoint = waypoints[self.waypointIdx]
-		end
-	end
-	if not waypoint then
-		self.waypoints = nil
-		return
-	end
-	self.humanoid:MoveTo(waypoint.Position)
-end
-
---[[
-	Idle: wander speed, waiting for perception to hand over a target. Seeing a
-	player starts a stalk (or a straight engage for archetypes that don't
-	stalk); merely hearing footsteps sends the mob to investigate the noise.
-]]
-States.Idle = {
-	enter = function(ctrl)
-		ctrl.humanoid.WalkSpeed = ctrl.archetype.walkSpeed
-	end,
-	step = function(ctrl, state, now)
-		local target = acquireVisibleTarget(ctrl, now)
-		if target and ctrl.archetype.useStalking then
-			-- start part-way to the engage threshold: the mob is already
-			-- interested, stalking only decides how quickly it commits
-			ctrl.blackboard.aggression = ctrl.archetype.engageThreshold * STALK_START_AGGRESSION
-			return toStalking(target, now + FIRST_STRAFE_DELAY)
-		end
-		if target then
-			return toEngaging(target)
-		end
-		local heard = ctrl.lastPercept.heard
-		if #heard > 0 then
-			return toSearching(ctrl, now, heard[1])
-		end
-		return state
-	end,
-}
-
---[[
-	Stalking: circle the player at standoff range while aggression builds.
-	Aggression rises only while the mob can see its target and decays in
-	step(), so a player who breaks line of sight cools the mob down again.
-	Two whiffed swings also drop the mob back here (see Recovery), which is
-	what makes a fight feel like probing rather than a wall of attacks.
-]]
-States.Stalking = {
-	enter = function(ctrl)
-		ctrl.humanoid.WalkSpeed = ctrl.archetype.walkSpeed
-		ctrl.director.clearPath(ctrl)
-	end,
-	step = function(ctrl, state, now, elapsed)
-		local arch = ctrl.archetype
-		local target, root = liveTargetRoot(ctrl)
-		if not target or not root then
-			return toSearching(ctrl, now)
-		end
-		if refreshSighting(ctrl, root, now) then
-			ctrl.blackboard.aggression += arch.aggressionPerSec * elapsed
-		end
-		if ctrl.blackboard.aggression >= arch.engageThreshold then
-			return toEngaging(target)
-		end
-		-- the dispatcher matched the tag, so narrowing the union is safe here
-		local stalking = state :: Types.StateStalking
-		if now < stalking.nextStrafeAt then
-			return state
-		end
-		stalking.nextStrafeAt = now + rng:NextNumber(arch.strafeIntervalLo, arch.strafeIntervalHi)
-		if rng:NextNumber() < STRAFE_FLIP_CHANCE then
-			stalking.strafeDir = -stalking.strafeDir
-		end
-		ctrl.humanoid:MoveTo(strafeGoal(ctrl, root.Position, stalking.strafeDir))
-		return state
-	end,
-}
-
---[[
-	Engaging: close in along a Director path and fight. The order of the
-	checks is the priority order: reacting to an incoming swing beats starting
-	our own, which beats the opportunistic hold-block, which beats re-pathing
-	-- a mob that is about to be hit should not be asking for a new path.
-]]
-States.Engaging = {
-	enter = function(ctrl)
-		ctrl.humanoid.WalkSpeed = ctrl.archetype.runSpeed
-	end,
-	exit = function(ctrl)
-		ctrl.director.clearPath(ctrl)
-	end,
-	step = function(ctrl, state, now)
-		local arch = ctrl.archetype
-		local target, root = liveTargetRoot(ctrl)
-		if not target or not root then
-			return toSearching(ctrl, now)
-		end
-		refreshSighting(ctrl, root, now)
-		local pos = ctrl.hrp.Position
-		local distSq = distanceSq(pos, root.Position)
-		local reaction = tryReactiveGuard(ctrl, target, distSq, now)
-		if reaction then
-			return reaction
-		end
-		local inReach = distSq <= arch.attackReach * arch.attackReach
-		if inReach and now >= ctrl.blackboard.nextAttackAt then
-			return toAttackWindup(target, now + arch.windupDuration)
-		end
-		local holdBlock = tryHoldBlock(ctrl, distSq, now)
-		if holdBlock then
-			return holdBlock
-		end
-		requestPathIfStale(ctrl, pos, root.Position)
-		return state
-	end,
-}
-
---[[
-	AttackWindup: the telegraph. The mob plants so steer() can aim it precisely
-	while the player still has a moment to react. Committing here rather than
-	in Engaging is what gives every attack a readable start-up.
-]]
-States.AttackWindup = {
-	enter = plant,
-	exit = unplant,
-	step = function(ctrl, state, now)
-		if not liveTarget(ctrl) then
-			return toRecovery(ctrl, now, false)
-		end
-		local windup = state :: Types.StateAttackWindup
-		if now < windup.endsAt then
-			return state
-		end
-		return toAttackActive(windup.target, now + ctrl.archetype.activeDuration)
-	end,
-}
-
---[[
-	AttackActive: the one tick where the swing is attempted, then a hold until
-	the swing animation really ends. Recovery's MoveTo would rotate the rig
-	mid-animation and warp the swing arc, so the state waits for the track to
-	clear -- with a hard cap in case a track never reports stopping.
-]]
-States.AttackActive = {
-	step = function(ctrl, state, now)
-		local active = state :: Types.StateAttackActive
-		local bb = ctrl.blackboard
-		if not active.hitFired then
-			active.hitFired = true
-			bb.nextAttackAt = now + ctrl.archetype.attackCooldown
-			-- whiffs are counted so a mob that keeps missing backs off to
-			-- stalk instead of swinging at air forever
-			bb.whiffCount = if tryFireSwing(ctrl, now) then 0 else bb.whiffCount + 1
-		end
-		local trackDone = ctrl.combat.ActiveAttackTrack == nil
-		local timedOut = now >= active.endsAt + SWING_ANIM_GRACE
-		if (now >= active.endsAt and trackDone) or timedOut then
-			return toRecovery(ctrl, now, bb.whiffCount == 0)
-		end
-		return state
-	end,
-}
-
---[[
-	Recovery: the post-swing pause. steer() keeps the mob walking at the
-	target during it, so the pause reads as follow-through, not freezing.
-	When it ends, two misses in a row send a stalking archetype back to
-	circling with its aggression trimmed; otherwise the mob re-engages.
-]]
-States.Recovery = {
-	enter = function(ctrl)
-		ctrl.humanoid.WalkSpeed = ctrl.archetype.walkSpeed
-	end,
-	step = function(ctrl, state, now)
-		local recovery = state :: Types.StateRecovery
-		if now < recovery.endsAt then
-			return state
-		end
-		local target = liveTarget(ctrl)
-		if not target then
-			return toSearching(ctrl, now)
-		end
-		local arch = ctrl.archetype
-		local bb = ctrl.blackboard
-		if bb.whiffCount < WHIFFS_BEFORE_RESET then
-			return toEngaging(target)
-		end
-		bb.whiffCount = 0
-		if not arch.useStalking then
-			return toEngaging(target)
-		end
-		bb.aggression = math.min(bb.aggression, arch.engageThreshold * STALK_RESET_AGGRESSION)
-		return toStalking(target, now)
-	end,
-}
-
---[[
-	Searching: walk to the last known position and look around. Anything seen
-	on the way is engaged immediately (no stalking -- the mob was already
-	committed). When the memory window runs out the blackboard is wiped and
-	the mob returns to Idle.
-]]
-States.Searching = {
-	enter = function(ctrl, state)
-		local searching = state :: Types.StateSearching
-		ctrl.humanoid.WalkSpeed = ctrl.archetype.walkSpeed
-		ctrl.humanoid:MoveTo(searching.lastKnown)
-	end,
-	step = function(ctrl, state, now)
-		local target = acquireVisibleTarget(ctrl, now)
-		if target then
-			return toEngaging(target)
-		end
-		local searching = state :: Types.StateSearching
-		if now < searching.endsAt then
-			return state
-		end
-		local bb = ctrl.blackboard
-		bb.target = nil
-		bb.targetPlayer = nil
-		bb.lastKnownPos = nil
-		bb.aggression = 0
-		return toIdle()
-	end,
-}
-
---[[
-	Defending: plant, keep facing the attacker (steer() does the turning) and
-	raise the guard at raiseAt -- immediately for a block, after the telegraph
-	for a parry -- then hold until endsAt. Raising and releasing go through
-	CombatController so the guard has the same posture, parry window and
-	animations as a player's. Both cooldowns are armed on exit so a mob can
-	never chain guards back to back.
-]]
-States.Defending = {
-	enter = function(ctrl)
-		plant(ctrl)
-		ctrl.guardRaised = false
-	end,
-	exit = function(ctrl, _state, now)
-		if ctrl.guardRaised then
-			guarded(function()
-				ctrl.combat:guardReleased()
-			end)
-			ctrl.guardRaised = false
-		end
-		unplant(ctrl)
-		ctrl.blackboard.nextDefendReady = now + DEFEND_COOLDOWN
-		ctrl.blackboard.nextHoldBlockReady = now + ctrl.archetype.holdBlockCooldown
-	end,
-	step = function(ctrl, state, now)
-		local target = liveTarget(ctrl)
-		if not target then
-			return toSearching(ctrl, now)
-		end
-		local defending = state :: Types.StateDefending
-		if not ctrl.guardRaised and now >= defending.raiseAt then
-			raiseGuard(ctrl)
-		end
-		if now >= defending.endsAt then
-			return toEngaging(target)
-		end
-		return state
-	end,
-}
-
--- The one place a state change happens: the old state's exit, the new state's
--- enter, then the tag is mirrored for clients.
-local function transition(self: Controller, from: Types.State, to: Types.State, now: number)
-	local exit = States[from.tag].exit
-	if exit then
-		exit(self, from, now)
-	end
-	local enter = States[to.tag].enter
-	if enter then
-		enter(self, to, now)
-	end
-	if self.replicateState then
-		-- attributes replicate only to clients streaming this mob, and a mob
-		-- changes state a couple of times a second at most, so this is the
-		-- cheapest downlink for client VFX and debug overlays
-		self.humanoid:SetAttribute("AIState", to.tag)
+	local alreadyHit = {}
+	local lastSample = math.max(data.samples - 1, 1)
+	for i = 0, data.samples - 1 do
+		local at = data.at + data.window * (i / lastSample)
+		task.delay(at, meleeStep, cast, data, size, radius, alreadyHit)
 	end
 end
 
---[[
-	Builds a controller for a rig, or returns nil when the rig is not
-	combat-capable (no Humanoid or root part, or CombatController never
-	registered it). replicateState mirrors the FSM tag to an attribute so
-	clients can drive VFX and debug UI from it.
-]]
-function Controller.new(
-	mob: Model,
-	archetype: Types.ArchetypeConfig,
-	replicateState: boolean
-): Controller?
-	local humanoid = mob:FindFirstChildWhichIsA("Humanoid")
-	local root = rootPartOf(mob)
-	-- narrow the registry lookup to the slice this module actually uses
-	local combat = CombatController.fromCharacter(mob) :: CombatHandle?
-	if not humanoid or not root or not combat then
-		return nil
-	end
-	local api = assert(director, "MobController.setDirector must be called before new")
-
-	-- The server must own the root's physics: MoveTo and the CFrame aiming in
-	-- steer() are only authoritative for the owner, and a nearby client being
-	-- handed ownership would fight every correction the AI makes.
-	if root:CanSetNetworkOwnership() then
-		root:SetNetworkOwner(nil)
-	end
-
-	local fields: ControllerFields = {
-		mob = mob,
+-- everything gets scheduled off the skills frame timings
+function SkillCombat.run(
+	character: Model, humanoid: Humanoid, skill: SkillData, ignore: IgnoreFilter?,
+	_aimFunction: (() -> any)?, pointFunction: (() -> any)?, modifiers: Modifiers?
+)
+	local cast: Cast = {
+		character = character,
 		humanoid = humanoid,
-		hrp = root,
-		combat = combat,
-		archetype = archetype,
-		director = api,
-		replicateState = replicateState,
-		blackboard = {
-			lastSeen = 0,
-			aggression = 0,
-			whiffCount = 0,
-			nextAttackAt = 0,
-			pathCookie = 0,
-			nextDefendReady = 0,
-			nextHoldBlockReady = 0,
-			nextHoldBlockCheck = 0,
-		},
-		state = toIdle(),
-		lastPercept = Perception.newResult(),
-		guardRaised = false,
-		nextDecisionAt = 0,
-		nextSteerAt = 0,
-		nextRepathAt = 0,
-		lastStepAt = os.clock(),
-		waypointIdx = 1,
-		alive = true,
-		janitor = Janitor.new(),
+		skill = skill,
+		ignore = ignore,
+		modifiers = modifiers,
+		pointFunction = pointFunction,
+		isLocked = if rawget(skill, "lock") then true else false,
 	}
-	local self = setmetatable(fields, Controller)
-	if replicateState then
-		humanoid:SetAttribute("AIState", "Idle")
+
+	-- locked skills keep the aim from cast time
+	local root = getRootPart(character)
+	if cast.isLocked and modifiers and typeof(modifiers.origin) == "CFrame" then
+		cast.lockedOrigin = modifiers.origin
+	end
+	if cast.isLocked and pointFunction and root then
+		cast.aimSpot = SkillCombat.point(root, pointFunction(), skill.aimReach)
 	end
 
-	-- Both ways a mob can stop existing funnel into destroy(); the Janitor
-	-- owns the connections so destroy() can never leak them.
-	self.janitor:Add(mob.Destroying:Connect(function()
-		self:destroy()
-	end))
-	self.janitor:Add(humanoid.Died:Connect(function()
-		self:destroy()
-	end))
-	return self
-end
-
---[[
-	One decision tick, called by the Director on the archetype's decision
-	interval (or sooner, when the current state has a deadline). Memory upkeep
-	runs first so every state sees a consistent blackboard: aggression cools,
-	and a target that has been out of sight longer than the memory window is
-	dropped -- but its last known position is kept so Searching still has
-	somewhere to walk. Then perception, then the state handler, then the
-	transition through the one choke point.
-]]
-function Controller.step(self: Controller, now: number, elapsed: number)
-	if not self.alive then
-		return
+	local field = rawget(skill, "field")
+	if field then
+		for i = 0, math.max(1, math.floor(field.duration / field.tick)) do
+			task.delay(field.at + i * field.tick, fieldTick, cast, field)
+		end
 	end
-	local arch = self.archetype
-	local bb = self.blackboard
-	if bb.aggression > 0 then
-		bb.aggression = math.max(0, bb.aggression - arch.aggressionDecayPerSec * elapsed)
-	end
-	if bb.target and now - bb.lastSeen > arch.memoryDuration then
-		bb.target = nil
-		bb.targetPlayer = nil
-	end
-	-- the result table is handed back in and refilled, so perception in
-	-- steady state allocates nothing per tick
-	self.lastPercept = Perception.query(self.mob, self.hrp, arch, now, self.lastPercept)
-
-	local current = self.state
-	local nextState = States[current.tag].step(self, current, now, elapsed)
-	if nextState.tag ~= current.tag then
-		transition(self, current, nextState, now)
-	end
-	self.state = nextState
-end
-
---[[
-	Movement tick, run more often than step() and independently of it. Two
-	jobs: keep the rig aimed at the target while fighting, and walk the
-	current path one waypoint at a time. Aiming writes the root CFrame directly
-	instead of relying on Humanoid AutoRotate: the windup and guard states
-	switch AutoRotate off, and a MoveTo would turn the body along the path
-	rather than at the target.
-]]
-function Controller.steer(self: Controller)
-	if not self.alive then
-		return
-	end
-	local tag = self.state.tag
-	local target = self.blackboard.target
-	local root = if target then rootPartOf(target) else nil
-	if root and FACE_TARGET_STATES[tag] then
-		faceTowards(self.hrp, root.Position)
-	end
-	if tag == "Recovery" and root then
-		-- follow-through: keep pressing toward the target between swings
-		self.humanoid:MoveTo(root.Position)
-	elseif tag == "Engaging" then
-		-- the only state that ever asks the Director for a path
-		followPath(self)
+	for _, data in ipairs(rawget(skill, "hits") or {}) do
+		scheduleMeleeHit(cast, data)
 	end
 end
 
--- Idempotent teardown: the Director, the Destroying signal and Died can all
--- race to call it. Once alive is false the Director skips the controller and
--- drops it on its next tick.
-function Controller.destroy(self: Controller)
-	if not self.alive then
-		return
-	end
-	self.alive = false
-	Perception.dropCacheFor(self.mob)
-	self.janitor:Destroy()
-	self.waypoints = nil
-end
+SkillCombat.applySlow = applySlow
+SkillCombat.applyStun = applyStun
+SkillCombat.buffOf = getBuff
+SkillCombat.bodyHit = bodyHit
+SkillCombat.touches = touches
+SkillCombat.strike = strike
+SkillCombat.sample = sample
 
-local MobController = {
-	new = Controller.new,
-	setDirector = setDirector,
-}
-
-return MobController
+return SkillCombat
